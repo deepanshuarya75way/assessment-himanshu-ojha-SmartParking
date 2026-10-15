@@ -475,54 +475,108 @@ app.get('/api/sessions', requireAdmin, async (req, res) => {
     res.status(500).json({ error: 'An internal server error occurred' });
   }
 });
+class BookingError extends Error{
+  constructor(status, message){
+    super(message);
+    this.status=status;
+  }
+}
 
-app.post('/api/sessions', writeLimiter, requireAuth, async (req, res) => {
-  try {
-    // Fix #2: Destructure only the expected fields.
-    // Fix #8: No manual session_id — MongoDB _id (ObjectId) is unique by design
-    //         and eliminates the race condition from manual auto-increment.
-    // slot_id and zone_id are FK references; slot_number and zone_name are denormalized display fields.
-    const { slot_id, zone_id, slot_number, zone_name, vehicle_plate, driver_name, entry_time, status } = req.body;
-    const user_id = req.user.userId;
+const escapeRegex = (s) => s.replace(/[.*+?^${}[]()|[\]\\]/g, '\\$&\)');
 
-    // Prevent user from starting multiple sessions for the exact same vehicle plate
-    const existingActiveSession = await Session.findOne({
-      user_id: user_id,
-      vehicle_plate: { $regex: new RegExp('^' + vehicle_plate + '$', 'i') },
-      status: 'Active'
-    });
-    if (existingActiveSession) {
-      return res.status(400).json({ error: `You already have an active session for the vehicle plate "${vehicle_plate}".` });
+app.post('/api/sessions', writeLimiter, requireAuth, async(req, res)=>{
+  let slotReserved = false;
+  let zoneDecremented = false;
+  let session = null;
+  let zoneId = null;
+  let slotId = null;
+  try{
+    slotId = Number(req.body.slot_id);
+    zoneId = Number(req.body.zone_id);
+    const {vehicle_plate, driver_name} = req.body;
+
+  if (!Number.isInteger(slotId)|| !Number.isInteger(zoneId)){
+    throw new BookingError(400, 'slot_id and zone_id must be integers'); 
+  }
+  if(typeof vehicle_plate!== 'string' || !vehicle_plate.trim() || typeof driver_name!== 'string' || driver_name.trim()){
+    throw new BookingError(400, 'vehicle plate and driver name are required');
+  }
+
+  const plate = vehicle_plate.trim();
+  const user_id = req.user.userId;
+
+  const existingActive = await Session.findOne({
+    user_id, 
+    vehicle_plate:{ $regex: new RegExp('^'+escapeRegex(plate) + '$', 'i')}, 
+    status:'Active'
+  });
+
+  if (existingActive){
+    throw new BookingError(400, 'You already have an active session for the vehicle plate "${plate}".');
+  }
+  const zone = await Zone.findOne({zone_id:zoneID});
+  if(!zone) throw new BookingError(404, 'Zone not Found');
+  
+  
+  const slot = await Slot.findOneAndUpdate(
+    {slot_id: slotId, zone_id: zoneId , status: 'Available'},
+    { status:'Occupied' },
+    {new: true});
+
+    if (!slot){
+      const existing = await Slot.findOne({slot_id:slotId});
+      if(!existing) throw new BookingError(404, 'Slot not Found');
+      if (existing.zone_id !== zoneId) throw new BookingError(400, 'Slot does not belong to the selected zone');
+      throw new BookingError(409, 'Slot is not available (currently ${existing.status})');
+      }
+      slotReserved = true;
+
+      const updatedZone = await Zone.findOneAndUpdate(
+        {zone_id:zoneId, available_slots: {$gt:0}}, 
+        {$inc:{available_slots:{$gt:0}}}, 
+        {new:true}
+      );
+      if (!updatedZone) throw new BookingError(409, 'Zone has no available capacity');
+      zoneDecremented = true;
+
+      session = await Session.create({
+        slot_id = slot.slot_id, 
+        zone_id: zone.zone_id, 
+        slot_number: slot.slot_number, 
+        zone_name = zone.zone_name, 
+        vehicle_plate: plate, 
+        driver_name: driver_name.trim(), 
+        entry_time: new Date(), 
+        status: 'Active', 
+        user_id
+      });
+
+      await Payment.create({session_ref:session_id, status:'Pending'});
+
+      return res.status(201).json(session);
+    } catch (err){
+      try{
+        if (session){
+          await Payment.deleteMany({session_ref: session._id});
+          await session.findByIdAndDelete(session._id);
+        }
+        if (zoneDecremented){
+          await zone.findOneAndUpade({ zone_id: zoneID},{$inc : { available_slot: 1}});
+        }
+        if(slotReserved){
+        await Slot.findOneAndUpadte({ slot_id : slotId , status: 'Occupied'},{ status : 'Available'});
+      }
+    } catch (rollbackErr){
+      console.error('Booking rollback failed:', rollbackErr);
     }
-
-    const obj = new Session({ slot_id, zone_id, slot_number, zone_name, vehicle_plate, driver_name, entry_time, status, user_id });
-    await obj.save();
-
-    // Mark slot as occupied using the integer FK — immune to slot_number renames
-    await Slot.findOneAndUpdate(
-      { slot_id: obj.slot_id },
-      { status: "Occupied" }
-    );
-
-    // Decrease zone availability using the integer FK — immune to zone_name renames
-    await Zone.findOneAndUpdate(
-      { zone_id: obj.zone_id },
-      { $inc: { available_slots: -1 } }
-    );
-
-    // Create a pending payment linked by session ObjectId.
-    // driver_name and vehicle_plate are NOT stored in Payment (3NF) — join from Session when needed.
-    await Payment.create({
-      session_ref: obj._id,
-      status: "Pending"
-    });
-
-    res.status(201).json(obj);
-  } catch (err) {
-    console.error('POST /api/sessions error:', err);
-    res.status(400).json({ error: err.message || 'Invalid session data provided' });
+    if (err instanceof BookingError){
+      return res.status(err.status).json({ error : err.message });
+    }
+    console.error('Post/api/session error:',err);
+    return res.status(500).json({error: 'An internal server error occurred'});
   }
 });
+
 
 app.put('/api/sessions/:id', writeLimiter, requireAuth, async (req, res) => {
   try {

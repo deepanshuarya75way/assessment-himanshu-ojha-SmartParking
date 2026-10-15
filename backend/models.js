@@ -56,6 +56,12 @@ const SessionSchema = new mongoose.Schema({
   // Optional FK to User — set when a logged-in customer starts the session
   user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
+
+SessionSchema.index(
+  {slot_id:1}, 
+  {unique:true, partialFilterExpression:{status:'Active'}}
+);
+
 const Session = mongoose.model('Session', SessionSchema);
 
 // MongoDB _id (ObjectId) is the primary key — payment_id removed to avoid race conditions.
